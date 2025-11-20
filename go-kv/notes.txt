@@ -1,0 +1,17 @@
+Reading data from file:
+1. Read raw bytes:
+    buf := make([]byte, 16)
+    f.read(buf)
+
+2. Buffered Reading:
+    reader := bufio.NewReader(f)
+    reader.Read() : raw bytes
+    reader.ReadString()
+
+3. Higher level text interface:
+    scanner := bufio.NewScanner(f)
+    scanner.Scan(): scanner.Text()
+    strings.Fields(text)
+
+
+Try cobra to convert to a fully featured CLI tool
