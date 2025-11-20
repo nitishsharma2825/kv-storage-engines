@@ -15,3 +15,18 @@ Reading data from file:
 
 
 Try cobra to convert to a fully featured CLI tool
+
+Encoder appends to the file as long as file is opened in append mode or file pointer is at end
+It does not truncate or overwrite the file, it simply writes JSON bytes starting at current file offset
+It internally does file.Write() at current offset
+
+Mixing file.Seek() and bufio.Writer on the same file can cause offset issues since
+bufio.Writer keeps its own internal buffer, it does know you called Seek()
+Once you wrap a file in bufio.NewWriter(), must not call f.Seek and must not perform unbuffered writes to that same file
+So don't buffer when you seek
+
+
+
+Time taken:
+Proj 1: 4900ms
+Proj 2: 18000ms
