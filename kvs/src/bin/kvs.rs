@@ -31,7 +31,7 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    let mut store = KvStore::open(std::env::current_dir()?)?;
+    let store = KvStore::open(std::env::current_dir()?)?;
 
     let cli = Cli::parse();
     match &cli.commands {
