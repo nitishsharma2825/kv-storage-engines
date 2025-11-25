@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use kvs::KvStore;
+use kvs::{KvStore, Result};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -30,23 +30,25 @@ enum Commands {
     },
 }
 
-fn main() {
-    let mut kv_store = KvStore::new();
-    let cli = Cli::parse();
+fn main() -> Result<()> {
+    let mut store = KvStore::open(std::env::current_dir()?)?;
 
+    let cli = Cli::parse();
     match &cli.commands {
         Commands::Get { key } => {
-            let result = kv_store.get(key.to_string());
-            match result {
-                Some(val) => println!("{}", val),
-                None => println!("Value does not exist"),
+            match store.get(key.to_string()) {
+                Ok(Some(value)) => println!("{value}"),
+                Ok(None) => println!("Key not found"),
+                Err(e) => eprintln!("{e}"),
             }
-        }
+        },
         Commands::Set { key, value } => {
-            kv_store.set(key.to_string(), value.to_string());
+            store.set(key.to_string(), value.to_string())?;
         }
         Commands::RM { key } => {
-            kv_store.remove(key.to_string());
-        }
+            store.remove(key.to_string())?
+        },
     }
+
+    Ok(())
 }
