@@ -1,7 +1,7 @@
-use std::{collections::HashMap, fs::{File, OpenOptions}, io::{self, BufReader, BufWriter, Read, Seek, Write}, path::PathBuf, sync::{Mutex, PoisonError, RwLock}};
+use std::{collections::HashMap, fs::{File, OpenOptions}, io::{self, BufReader, BufWriter, Read, Seek, Write}, path::PathBuf, sync::PoisonError};
 
 const LOG_FILE: &str = "log.data";
-const COMPACTION_THRESHOLD_BYTES: u32 = 1024000;
+const COMPACTION_THRESHOLD_BYTES: u64 = 100;
 
 pub type Result<T> = std::result::Result<T, EngineError>;
 
@@ -12,83 +12,85 @@ pub enum EngineCommand {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct LogPointer {
-    offset: u32,
+struct LogPointer {
+    offset: u64,
 }
 
 pub struct KvStore {
-    log_path: PathBuf,
-    index: RwLock<HashMap<String, LogPointer>>,
-    cur_offset: Mutex<u32>,
-    reader: Mutex<BufReader<File>>, // works only with single thread code
-    writer: Mutex<BufWriter<File>>,
+    path: PathBuf,
+    index: HashMap<String, LogPointer>,
+    cur_offset: u64,
+    garbage: u64,
+    reader: BufReader<File>,
+    writer: BufWriter<File>,
 }
 
 impl KvStore {
     pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
-        let log_path = PathBuf::from(path.into()).join(LOG_FILE);
+        let path = PathBuf::from(path.into()).join(LOG_FILE);
         let log_file = OpenOptions::new()
             .read(true)
             .write(true)
             .append(true)
             .create(true)
-            .open(&log_path)?;
+            .open(&path)?;
 
         let writer = BufWriter::new(log_file.try_clone()?); // independent file offsets
-        let reader_lock = Mutex::new(BufReader::new(log_file));
+        let mut reader = BufReader::new(File::open(&path)?);
         let mut index = HashMap::new();
         let mut cur_offset = 0;
+        let mut garbage = 0;
 
         loop {
-            let mut len_buf = [0u8; 4];
-            let mut reader_mut = reader_lock.lock()?;
-            match reader_mut.read_exact(&mut len_buf) {
+            let mut len_buf = [0u8; 8];
+            match reader.read_exact(&mut len_buf) {
                 Ok(()) => (),
                 Err(_) => break, // EOF
             }
 
-            let len = u32::from_le_bytes(len_buf);
+            let len = u64::from_le_bytes(len_buf);
             let mut buf = vec![0u8; len as usize];
-            reader_mut.read_exact(&mut buf)?;
+            reader.read_exact(&mut buf)?;
 
             let entry: EngineCommand = bincode::deserialize(&buf)?;
             match entry {
                 EngineCommand::SetCommand { key, .. } => {
-                    index.insert(key, LogPointer { offset: cur_offset });
-                    cur_offset = cur_offset + 4 + len;
+                    if index.insert(key, LogPointer { offset: cur_offset }).is_some() {
+                        garbage = garbage + len + 8; 
+                    }
+                    cur_offset = cur_offset + 8 + len;
                 },
                 EngineCommand::RmCommand { key } => {
-                    index.remove(&key);
-                    cur_offset = cur_offset + 4 + len;
+                    if index.remove(&key).is_some() {
+                        garbage = garbage + len + 8;
+                    }
+                    cur_offset = cur_offset + 8 + len;
                 },
             };
         }
 
         Ok(KvStore {
-            log_path: log_path,
-            index: RwLock::new(index),
-            cur_offset: Mutex::new(cur_offset),
-            reader: reader_lock,
-            writer: Mutex::new(writer),
+            path: path,
+            index: index,
+            cur_offset: cur_offset,
+            garbage: garbage,
+            reader: reader,
+            writer: writer,
         })
     }
 
-    pub fn get(&self, key: String) -> Result<Option<String>> {
-        // acquire read lock on index, blocks thread
-        let index_lock = self.index.read()?;
-        let mut reader = self.reader.lock()?;
-
-        match index_lock.get(&key).cloned() {
+    pub fn get(&mut self, key: String) -> Result<Option<String>> {
+        match self.index.get(&key).cloned() {
             Some(log_pointer) => {
-                reader.seek(io::SeekFrom::Start(log_pointer.offset as u64))?;
+                self.reader.seek(io::SeekFrom::Start(log_pointer.offset as u64))?;
 
-                let mut len_buf = [0u8; 4];
-                reader.read_exact(&mut len_buf)?;
+                let mut len_buf = [0u8; 8];
+                self.reader.read_exact(&mut len_buf)?;
 
-                let len = u32::from_le_bytes(len_buf);
+                let len = u64::from_le_bytes(len_buf);
 
                 let mut cmd = vec![0u8; len as usize];
-                reader.read_exact(&mut cmd)?;
+                self.reader.read_exact(&mut cmd)?;
 
                 let log_entry: EngineCommand = bincode::deserialize(&cmd)?;
                 match log_entry {
@@ -100,139 +102,94 @@ impl KvStore {
         }
     }
 
-    pub fn set(&self, key: String, value: String) -> Result<()>{
-        // acquire locks
-        let mut index_lock = self.index.write()?;
-        let mut writer_lock = self.writer.lock()?;
-        let mut offset_lock = self.cur_offset.lock()?;
-
+    pub fn set(&mut self, key: String, value: String) -> Result<()>{
         let set_command = EngineCommand::SetCommand { key: key.clone(), value: value.clone() };
         let bytes = bincode::serialize(&set_command)?;
 
-        let length = bytes.len() as u32;
-        writer_lock.write_all(&length.to_le_bytes())?;
-        writer_lock.write_all(&bytes)?;
-        writer_lock.flush()?;
+        let length = bytes.len() as u64;
+        self.writer.write_all(&length.to_le_bytes())?;
+        self.writer.write_all(&bytes)?;
+        self.writer.flush()?;
 
-        index_lock.insert(key, LogPointer { offset: *offset_lock });
+        if self.index.insert(key, LogPointer { offset: self.cur_offset }).is_some() {
+            self.garbage += 8 + length;
+        }
+        self.cur_offset = self.cur_offset + 8 + length;
 
-        *offset_lock = *offset_lock + 4 + length;
-
-        let should_compact = true;
-
-        drop(index_lock);
-        drop(writer_lock);
-        drop(offset_lock);
-
-        if should_compact {
+        if self.garbage > COMPACTION_THRESHOLD_BYTES {
             self.compact()?;
         }
 
         Ok(())
     }
 
-    pub fn remove(&self, key: String) -> Result<()>{
-        // acquire locks
-        let mut index_lock = self.index.write()?;
-        let mut writer_lock = self.writer.lock()?;
-        let mut offset_lock = self.cur_offset.lock()?;
-
-        if index_lock.get(&key).is_none() {
-            println!("Key not found");
+    pub fn remove(&mut self, key: String) -> Result<()>{
+        if self.index.get(&key).is_none() {
             return Err(EngineError::KeyNotFound);
         }
 
         let rm_command = EngineCommand::RmCommand { key: key.clone() };
         let bytes = bincode::serialize(&rm_command)?;
 
-        let length = bytes.len() as u32;
-        writer_lock.write_all(&length.to_le_bytes())?;
-        writer_lock.write_all(&bytes)?;
-        writer_lock.flush()?;
+        let length = bytes.len() as u64;
+        self.writer.write_all(&length.to_le_bytes())?;
+        self.writer.write_all(&bytes)?;
+        self.writer.flush()?;
 
-        index_lock.remove(&key);
-        *offset_lock = *offset_lock + 4 + length;
-
-        let should_compact = *offset_lock >= COMPACTION_THRESHOLD_BYTES;
-
-        drop(index_lock);
-        drop(writer_lock);
-        drop(offset_lock);
-
-        if should_compact {
-            self.compact()?;
+        if self.index.remove(&key).is_some() {
+            self.garbage += 8 + length;
         }
+        self.cur_offset = self.cur_offset + 8 + length;
 
         Ok(())
     }
 
-    fn compact(&self) -> Result<()> {
-        let temp_log_path = self.log_path.parent().unwrap().join(PathBuf::from("temp_log.data"));
+    fn compact(&mut self) -> Result<()> {
+        let temp_log_path = self.path.parent().unwrap().join(PathBuf::from("temp_log.data"));
         let temp_log_file = OpenOptions::new()
-            .read(true)
             .write(true)
-            .truncate(true)
+            .append(true)
             .create(true)
             .open(&temp_log_path)?;
-
-        let mut index_lock = self.index.write()?;
-        let mut _writer_lock = self.writer.lock()?;
-        let mut reader = self.reader.lock()?;
-        let mut offset_lock = self.cur_offset.lock()?;
 
         let mut writer = BufWriter::new(temp_log_file.try_clone()?);
         let mut new_offset = 0;
 
-        let entries: Vec<(String, LogPointer)> = index_lock
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
+        for cmd in self.index.values_mut() {
+            self.reader.seek(io::SeekFrom::Start(cmd.offset))?;
 
-        for (key, log_pointer) in entries {
-            reader.seek(io::SeekFrom::Start(log_pointer.offset as u64))?;
+            // read 8 byte length
+            let mut len_buf = [0u8; 8];
+            self.reader.read_exact(&mut len_buf)?;
+            let len = u64::from_le_bytes(len_buf) as usize;
+            
+            let mut payload = vec![0u8; len];
+            self.reader.read_exact(&mut payload)?;
 
-            let mut len_buf = [0u8; 4];
-            reader.read_exact(&mut len_buf)?;
+            writer.write_all(&len_buf)?;
+            writer.write_all(&payload)?;
 
-            let len = u32::from_le_bytes(len_buf);
+            cmd.offset = new_offset;
 
-            let mut cmd = vec![0u8; len as usize];
-            reader.read_exact(&mut cmd)?;
-
-            let log_entry: EngineCommand = bincode::deserialize(&cmd)?;
-            match log_entry {
-                EngineCommand::SetCommand { value, .. } => {
-                    let set_command = EngineCommand::SetCommand { key: key.clone(), value: value };
-                    let bytes = bincode::serialize(&set_command)?;
-
-                    let length = bytes.len() as u32;
-                    writer.write_all(&length.to_le_bytes())?;
-                    writer.write_all(&bytes)?;
-
-                    let new_log_pointer = LogPointer { offset: new_offset };
-                    index_lock.insert(key, new_log_pointer);
-                    new_offset += 4 + length;
-                },
-                EngineCommand::RmCommand { .. } => return Err(EngineError::UnexpectedResult)
-            };
+            new_offset = new_offset + 8 + len as u64;
         }
 
         writer.flush()?;
-        drop(writer);
         temp_log_file.sync_all()?;
 
-        std::fs::rename(&temp_log_path, &self.log_path)?;
+        std::fs::rename(&temp_log_path, &self.path)?;
 
         let new_file = OpenOptions::new()
             .read(true)
             .write(true)
             .append(true)
-            .open(&self.log_path)?;
+            .open(&self.path)?;
 
         // update data structures
-        *offset_lock = new_offset;
-        *_writer_lock = BufWriter::new(new_file.try_clone()?);
-        *reader = BufReader::new(new_file);
+        self.cur_offset = new_offset;
+        self.writer = BufWriter::new(new_file.try_clone()?);
+        self.reader = BufReader::new(File::open(&self.path)?);
+        self.garbage = 0;
 
         Ok(())
     }

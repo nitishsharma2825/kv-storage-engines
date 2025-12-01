@@ -1,3 +1,5 @@
+use std::process::exit;
+
 use clap::{Parser, Subcommand};
 use kvs::{KvStore, Result};
 
@@ -31,7 +33,7 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    let store = KvStore::open(std::env::current_dir()?)?;
+    let mut store = KvStore::open(std::env::current_dir()?)?;
 
     let cli = Cli::parse();
     match &cli.commands {
@@ -43,10 +45,20 @@ fn main() -> Result<()> {
             }
         },
         Commands::Set { key, value } => {
-            store.set(key.to_string(), value.to_string())?;
+            match store.set(key.to_string(), value.to_string()) {
+                Ok(()) => (),
+                Err(e) => eprintln!("{e}"),
+            }
         }
         Commands::RM { key } => {
-            store.remove(key.to_string())?
+            match store.remove(key.to_string()) {
+                Ok(()) => (),
+                Err(kvs::EngineError::KeyNotFound) => {
+                    println!("Key not found");
+                    exit(1);
+                }
+                Err(e) => eprintln!("{e}"),
+            }
         },
     }
 
